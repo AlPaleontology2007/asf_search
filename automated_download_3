@@ -1,0 +1,324 @@
+!pip install -q asf_search contextily fiona geopandas shapely pyproj
+
+import warnings
+warnings.filterwarnings("ignore")
+import logging
+logging.getLogger("asf_search").setLevel(logging.ERROR)  # suppress WKT repair/validation warnings
+
+import os
+import getpass
+import asf_search as asf
+import geopandas as gpd
+import pandas as pd
+from datetime import datetime
+from shapely import wkt
+from shapely.geometry import shape, Point
+
+
+# ====================================================================
+# STEP 1 — AOI / date range / orbit direction
+# ====================================================================
+
+aoi = input("Enter AOI as a WKT POLYGON (e.g. POLYGON((-118.20 41.02,-118.05 41.02,-118.05 40.95,-118.20 40.95,-118.20 41.02))): ").strip()
+aoi_poly = wkt.loads(aoi)
+
+def get_date(prompt):
+    while True:
+        raw = input(f"{prompt} (format YYYY/MM/DD): ").strip()
+        try:
+            dt = datetime.strptime(raw, "%Y/%m/%d")
+            return dt.strftime("%Y-%m-%dT12:00:00Z")
+        except ValueError:
+            print("Invalid format, please use YYYY/MM/DD (e.g. 2024/12/08).")
+
+start_date = get_date("Enter start date")
+end_date = get_date("Enter end date")
+
+def get_orbit_direction():
+    while True:
+        raw = input("Enter orbit direction (D = Descending, A = Ascending): ").strip().upper()
+        if raw == "D":
+            return asf.FLIGHT_DIRECTION.DESCENDING
+        elif raw == "A":
+            return asf.FLIGHT_DIRECTION.ASCENDING
+        else:
+            print("Invalid input, please enter D or A.")
+
+flight_direction = get_orbit_direction()
+
+opts = {
+    "platform": asf.PLATFORM.SENTINEL1,
+    "start": start_date,
+    "end":   end_date,
+    "flightDirection": flight_direction,
+    "processingLevel": "SLC",
+}
+
+buffer_m = 6000
+
+# ====================================================================
+# STEP 2 — Search ASF over the polygon (buffered slightly) - silent
+# ====================================================================
+
+aoi_poly_m = gpd.GeoSeries([aoi_poly], crs=4326).to_crs(3857).iloc[0]
+aoi_buffer_m = aoi_poly_m.buffer(buffer_m)
+aoi_buffer_4326 = gpd.GeoSeries([aoi_buffer_m], crs=3857).to_crs(4326).iloc[0]
+aoi_wkt = aoi_buffer_4326.wkt
+
+results = asf.geo_search(intersectsWith=aoi_wkt, **opts)
+granules = [r.properties["fileID"] for r in results]
+pr = asf.product_search(granules)
+
+rows = []
+for r in pr:
+    props = dict(r.properties)
+    start_time = props.get("startTime")
+    scene_date = start_time[:10] if start_time else None
+    rows.append({
+        "fileID": props.get("fileID"),
+        "Frame":  props.get("frameNumber"),
+        "Path":   props.get("pathNumber"),
+        "Date":   scene_date,
+        "geometry": shape(r.geometry),
+    })
+
+gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+gdf = gdf.dropna(subset=["Path"]).drop_duplicates(subset=["fileID"]).reset_index(drop=True)
+gdf_m = gdf.to_crs(3857)
+
+# ====================================================================
+# STEP 3 — Frame/Path selection, two passes - silent:
+#  1) PRIMARY - keep any frame covering >= min_coverage_frac of ITS
+#     OWN footprint inside the AOI, then gap-fill whatever's still
+#     missing to reach 100% coverage.
+#  2) CLOSE ALTERNATIVES - for every frame NOT in the primary set
+#     (from ANY path), find the primary frame(s) it spatially
+#     overlaps and compare own_overlap. If close (>= close_ratio of
+#     the best overlapping primary frame), keep it too - a genuine
+#     near-tie, not a weak corner-clipper.
+# ====================================================================
+
+min_coverage_frac = 0.30  # a frame must have at least this fraction of ITS OWN
+                           # footprint inside the AOI to clear the primary pass
+close_ratio = 0.7          # a non-primary frame is kept if its own_overlap is at
+                            # least this fraction of the best overlapping primary
+                            # frame's own_overlap (i.e. "not a big difference")
+
+def select_with_close_alternatives(aoi_poly, gdf_m, min_coverage_frac=0.30, close_ratio=0.7):
+    aoi_area = aoi_poly.area
+    gdf_m = gdf_m.copy()
+    gdf_m["own_overlap"] = gdf_m.geometry.apply(
+        lambda g: g.intersection(aoi_poly).area / g.area if g.area > 0 else 0
+    )
+
+    # --- Pass 1: primary selection (threshold + gap-fill) ---
+    primary = gdf_m[gdf_m["own_overlap"] >= min_coverage_frac].copy()
+    pool = gdf_m[~gdf_m.index.isin(primary.index)].copy()
+
+    covered_union = primary.geometry.union_all() if len(primary) else None
+    remaining = aoi_poly if covered_union is None else aoi_poly.difference(covered_union)
+
+    gap_filled = []
+    eps = 1e-9
+    while not remaining.is_empty and len(pool) > 0:
+        gains = pool.geometry.apply(lambda g: g.intersection(remaining).area)
+        best_i = gains.idxmax()
+        best_gain = gains.loc[best_i]
+        if best_gain <= eps:
+            break
+        gap_filled.append(best_i)
+        remaining = remaining.difference(pool.geometry.loc[best_i])
+        pool = pool.drop(index=best_i)
+
+    if gap_filled:
+        primary = pd.concat([primary, gdf_m.loc[gap_filled]])
+
+    # --- Pass 2: pull in close alternatives (any Path) that nearly
+    # match an overlapping primary frame's own_overlap ---
+    remaining_candidates = gdf_m[~gdf_m.index.isin(primary.index)]
+    extra_idx = []
+    for idx, row in remaining_candidates.iterrows():
+        overlapping = primary[primary.geometry.intersects(row.geometry)]
+        if len(overlapping) == 0:
+            continue
+        best_nearby = overlapping["own_overlap"].max()
+        if best_nearby <= 0:
+            continue
+        if row["own_overlap"] / best_nearby >= close_ratio:
+            extra_idx.append(idx)
+
+    selected = pd.concat([primary, gdf_m.loc[extra_idx]]) if extra_idx else primary
+    selected = selected.drop(columns="own_overlap").reset_index(drop=True)
+
+    final_union = selected.geometry.union_all() if len(selected) else None
+    final_remaining = aoi_poly if final_union is None else aoi_poly.difference(final_union)
+    coverage = 1 - (final_remaining.area / aoi_area)
+    fully_covered = final_remaining.is_empty or coverage >= 1 - 1e-6
+
+    return selected, coverage, fully_covered
+
+aoi_poly_buf_m = aoi_buffer_m
+selected, frame_coverage, frames_fully_covered = select_with_close_alternatives(
+    aoi_poly_buf_m, gdf_m, min_coverage_frac, close_ratio
+)
+
+if len(selected) == 0:
+    raise RuntimeError("No frames found covering any part of the AOI - check search results/date range.")
+
+chosen_paths = sorted(selected["Path"].unique().tolist())
+
+# ====================================================================
+# STEP 4 — Show ONLY the scene table (ID / Frame / Path / Date)
+# ====================================================================
+
+scene_table = selected[["fileID", "Frame", "Path", "Date"]].sort_values(
+    by=["Path", "Frame", "Date"]
+).reset_index(drop=True)
+scene_table = scene_table.rename(columns={"fileID": "Scene ID"})
+
+print(scene_table.to_string(index=False))
+
+# ====================================================================
+# STEP 5 — Ask storage location: Google Drive or local Colab storage
+# ====================================================================
+
+def get_storage_choice():
+    while True:
+        raw = input("\nSave files to Google Drive or local Colab storage? (D = Drive, L = Local): ").strip().upper()
+        if raw in ("D", "L"):
+            return raw
+        print("Invalid input, please enter D or L.")
+
+storage_choice = get_storage_choice()
+
+if storage_choice == "D":
+    from google.colab import drive
+    drive.mount("/content/drive")
+    base_dir = "/content/drive/MyDrive/asf_trial_aparna/us_westcoast"
+else:
+    base_dir = "/content/us_westcoast"
+
+os.makedirs(base_dir, exist_ok=True)
+os.chdir(base_dir)
+
+# ====================================================================
+# STEP 6 — Cluster (Path, Frame) groups that are close together - silent
+# ====================================================================
+
+src = selected
+threshold = 100000  # 100 km
+
+df_pf = src[["fileID", "Path", "Frame"]].copy()
+df_pf = df_pf.dropna(subset=["Path", "Frame"]).copy()
+df_pf["Path"] = df_pf["Path"].astype(int)
+df_pf["Frame"] = df_pf["Frame"].astype(int)
+
+src_m = src.to_crs(3857).copy()
+
+rep = (
+    src_m.sort_values("fileID")
+         .groupby(["Path", "Frame"], as_index=False)
+         .first()[["Path", "Frame", "geometry"]]
+)
+
+bounds = rep.geometry.bounds
+rep["bl_point"] = [Point(xy) for xy in zip(bounds["minx"], bounds["miny"])]
+
+rep_pts = gpd.GeoDataFrame(rep[["Path", "Frame"]], geometry=rep["bl_point"], crs=3857)
+rep_pts["cluster_id"] = -1
+next_cluster = 0
+
+for path_val, idxs in rep_pts.groupby("Path").groups.items():
+    idxs = list(idxs)
+    sub = rep_pts.loc[idxs].copy()
+    sub = sub.reset_index(drop=False).rename(columns={"index": "orig_index"})
+
+    parent = list(range(len(sub)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    sidx = sub.sindex
+
+    for i, geom in enumerate(sub.geometry):
+        cand = list(sidx.intersection(geom.buffer(threshold).bounds))
+        for j in cand:
+            if j <= i:
+                continue
+            if geom.distance(sub.geometry.iloc[j]) <= threshold:
+                union(i, j)
+
+    roots = [find(i) for i in range(len(sub))]
+    local_cluster = pd.factorize(roots)[0]
+
+    rep_pts.loc[sub["orig_index"], "cluster_id"] = local_cluster + next_cluster
+    next_cluster += (local_cluster.max() + 1)
+
+pf_to_cluster = rep_pts.set_index(["Path", "Frame"])["cluster_id"]
+
+df_scene = df_pf.copy()
+df_scene["cluster_id"] = list(zip(df_scene["Path"], df_scene["Frame"]))
+df_scene["cluster_id"] = df_scene["cluster_id"].map(pf_to_cluster)
+
+# ====================================================================
+# STEP 7 — Create one folder per cluster - silent
+# ====================================================================
+
+folder_map = {}
+
+for cluster_id, sub in df_scene.groupby("cluster_id"):
+    path_val = int(sub["Path"].iloc[0])
+    frames = sorted(sub["Frame"].astype(int).unique())
+    folder_name = f"P{path_val}_" + "_".join([f"F{f}" for f in frames])
+
+    folder_path = os.path.join(base_dir, folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+
+    folder_map[int(cluster_id)] = folder_name
+
+# ====================================================================
+# STEP 8 — ASF login (credentials entered securely via getpass)
+# ====================================================================
+
+session = asf.ASFSession()
+asf_user = getpass.getpass("ASF username: ")
+asf_pw = getpass.getpass("ASF password: ")
+session.auth_with_creds(asf_user, asf_pw)
+del asf_user, asf_pw
+
+# ====================================================================
+# STEP 9 — Download granules into their cluster folders - silent
+# ====================================================================
+
+def folder_has_data(folder):
+    if not os.path.exists(folder):
+        return False
+    for fn in os.listdir(folder):
+        if fn.endswith(".zip") or fn.endswith(".SAFE"):
+            return True
+    return False
+
+for cluster_id, sub in df_scene.groupby("cluster_id"):
+    granule_ids = sub["fileID"].dropna().unique().tolist()
+    if not granule_ids:
+        continue
+
+    folder_name = folder_map[int(cluster_id)]
+    out_dir = os.path.join(base_dir, folder_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    if folder_has_data(out_dir):
+        continue
+
+    dl_results = asf.granule_search(granule_ids)
+    dl_results.download(path=out_dir, session=session, processes=1)
+
+print("\nDone.")
