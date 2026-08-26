@@ -1,0 +1,231 @@
+!pip install -q asf_search contextily fiona geopandas shapely pyproj
+
+import warnings
+warnings.filterwarnings("ignore")
+import asf_search as asf
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import contextily as ctx
+from datetime import datetime
+from shapely import wkt
+from shapely.geometry import shape
+
+
+# ------------------------------------------------------------------
+# User inputs
+# ------------------------------------------------------------------
+
+aoi = input("Enter AOI as a WKT POLYGON (e.g. POLYGON((-118.20 41.02,-118.05 41.02,-118.05 40.95,-118.20 40.95,-118.20 41.02))): ").strip()
+aoi_poly = wkt.loads(aoi)
+
+def get_date(prompt):
+    while True:
+        raw = input(f"{prompt} (format YYYY/MM/DD): ").strip()
+        try:
+            dt = datetime.strptime(raw, "%Y/%m/%d")
+            return dt.strftime("%Y-%m-%dT12:00:00Z")
+        except ValueError:
+            print("Invalid format, please use YYYY/MM/DD (e.g. 2024/12/08).")
+
+start_date = get_date("Enter start date")
+end_date = get_date("Enter end date")
+
+def get_orbit_direction():
+    while True:
+        raw = input("Enter orbit direction (D = Descending, A = Ascending): ").strip().upper()
+        if raw == "D":
+            return asf.FLIGHT_DIRECTION.DESCENDING
+        elif raw == "A":
+            return asf.FLIGHT_DIRECTION.ASCENDING
+        else:
+            print("Invalid input, please enter D or A.")
+
+flight_direction = get_orbit_direction()
+
+opts = {
+    "platform": asf.PLATFORM.SENTINEL1,
+    "start": start_date,
+    "end":   end_date,
+    "flightDirection": flight_direction,
+    "processingLevel": "SLC",
+}
+
+buffer_m = 6000  # small buffer around the AOI so edge-touching frames aren't missed
+
+# ------------------------------------------------------------------
+# Search ASF over the polygon (buffered slightly)
+# ------------------------------------------------------------------
+
+aoi_poly_m = gpd.GeoSeries([aoi_poly], crs=4326).to_crs(3857).iloc[0]
+aoi_buffer_m = aoi_poly_m.buffer(buffer_m)
+aoi_buffer_4326 = gpd.GeoSeries([aoi_buffer_m], crs=3857).to_crs(4326).iloc[0]
+aoi_wkt = aoi_buffer_4326.wkt
+
+results = asf.geo_search(intersectsWith=aoi_wkt, **opts)
+print(f"Total ASF results: {len(results)}")
+
+granules = [r.properties["fileID"] for r in results]
+pr = asf.product_search(granules)
+
+rows = []
+for r in pr:
+    props = dict(r.properties)
+    start_time = props.get("startTime")
+    scene_date = start_time[:10] if start_time else None
+    rows.append({
+        "fileID": props.get("fileID"),
+        "Frame":  props.get("frameNumber"),
+        "Path":   props.get("pathNumber"),
+        "Date":   scene_date,
+        "geometry": shape(r.geometry),
+    })
+
+gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+gdf = gdf.dropna(subset=["Path"]).drop_duplicates(subset=["fileID"]).reset_index(drop=True)
+print(f"SLCs after cleanup: {len(gdf)}")
+
+gdf_m = gdf.to_crs(3857)
+
+# ------------------------------------------------------------------
+# Frame selection, two passes:
+#  1) PRIMARY - keep any frame covering >= min_coverage_frac of the AOI
+#     by itself, then gap-fill whatever's still missing to reach 100%.
+#  2) CLOSE ALTERNATIVES - for every frame NOT in the primary set
+#     (from ANY path), find the primary frame(s) it spatially overlaps
+#     and compare coverage. If its own coverage is close to the best
+#     overlapping primary frame (>= close_ratio of it), keep it too -
+#     it's a genuine near-tie, not a weak corner-clipper.
+# ------------------------------------------------------------------
+
+min_coverage_frac = 0.30  # a frame must have at least this fraction of ITS OWN
+                           # footprint inside the AOI to clear the primary pass.
+                           # (Fraction of the frame's own area, NOT of the AOI's
+                           # area - this stays meaningful no matter how large or
+                           # sprawling the AOI polygon is.)
+close_ratio = 0.7          # a non-primary frame is kept if its own_overlap is at
+                            # least this fraction of the best overlapping primary
+                            # frame's own_overlap (i.e. "not a big difference")
+
+def select_with_close_alternatives(aoi_poly, gdf_m, min_coverage_frac=0.30, close_ratio=0.7):
+    aoi_area = aoi_poly.area
+    gdf_m = gdf_m.copy()
+    # own_overlap: how much of THIS FRAME's own footprint falls inside the AOI.
+    # Scale-invariant w.r.t. AOI size/shape - unlike area/AOI_area, which breaks
+    # down for large or sprawling AOIs where no single frame can ever cover a
+    # meaningful percentage of the whole polygon.
+    gdf_m["own_overlap"] = gdf_m.geometry.apply(
+        lambda g: g.intersection(aoi_poly).area / g.area if g.area > 0 else 0
+    )
+
+    # --- Pass 1: primary selection (threshold + gap-fill) ---
+    primary = gdf_m[gdf_m["own_overlap"] >= min_coverage_frac].copy()
+    pool = gdf_m[~gdf_m.index.isin(primary.index)].copy()
+
+    covered_union = primary.geometry.union_all() if len(primary) else None
+    remaining = aoi_poly if covered_union is None else aoi_poly.difference(covered_union)
+
+    gap_filled = []
+    eps = 1e-9
+    while not remaining.is_empty and len(pool) > 0:
+        gains = pool.geometry.apply(lambda g: g.intersection(remaining).area)
+        best_i = gains.idxmax()
+        best_gain = gains.loc[best_i]
+        if best_gain <= eps:
+            break
+        gap_filled.append(best_i)
+        remaining = remaining.difference(pool.geometry.loc[best_i])
+        pool = pool.drop(index=best_i)
+
+    if gap_filled:
+        primary = pd.concat([primary, gdf_m.loc[gap_filled]])
+
+    # --- Pass 2: pull in close alternatives (any Path) that nearly
+    # match an overlapping primary frame's own_overlap ---
+    remaining_candidates = gdf_m[~gdf_m.index.isin(primary.index)]
+    extra_idx = []
+    for idx, row in remaining_candidates.iterrows():
+        overlapping = primary[primary.geometry.intersects(row.geometry)]
+        if len(overlapping) == 0:
+            continue
+        best_nearby = overlapping["own_overlap"].max()
+        if best_nearby <= 0:
+            continue
+        if row["own_overlap"] / best_nearby >= close_ratio:
+            extra_idx.append(idx)
+
+    selected = pd.concat([primary, gdf_m.loc[extra_idx]]) if extra_idx else primary
+    selected = selected.drop(columns="own_overlap").reset_index(drop=True)
+
+    final_union = selected.geometry.union_all() if len(selected) else None
+    final_remaining = aoi_poly if final_union is None else aoi_poly.difference(final_union)
+    coverage = 1 - (final_remaining.area / aoi_area)
+    fully_covered = final_remaining.is_empty or coverage >= 1 - 1e-6
+
+    return selected, coverage, fully_covered
+
+aoi_poly_buf_m = aoi_buffer_m  # cover the buffered AOI so edge frames count
+selected, frame_coverage, frames_fully_covered = select_with_close_alternatives(
+    aoi_poly_buf_m, gdf_m, min_coverage_frac, close_ratio
+)
+
+chosen_paths = sorted(selected["Path"].unique().tolist())
+
+print(f"\nSelected paths: {chosen_paths}")
+print(f"AOI coverage: {frame_coverage*100:.2f}%")
+if frames_fully_covered:
+    print("100% AOI coverage achieved.")
+else:
+    print("WARNING: could NOT reach 100% coverage - "
+          f"{(1-frame_coverage)*100:.2f}% of the AOI remains uncovered by any available scene.")
+print(f"Total selected frames (unique fileIDs): {len(selected)}")
+
+# ------------------------------------------------------------------
+# Save KML
+# ------------------------------------------------------------------
+
+kml_out = "polygon_selected_frames.kml"
+selected.to_crs(4326)[["fileID", "Frame", "Path", "geometry"]].to_file(kml_out, driver="KML")
+print(f"Saved KML: {kml_out}")
+
+# ------------------------------------------------------------------
+# Table of selected scenes: ID, Frame, Path, Date
+# ------------------------------------------------------------------
+
+scene_table = selected[["fileID", "Frame", "Path", "Date"]].sort_values(
+    by=["Path", "Frame", "Date"]
+).reset_index(drop=True)
+scene_table = scene_table.rename(columns={"fileID": "Scene ID"})
+
+print("\nSelected scenes:")
+print(scene_table.to_string(index=False))
+
+csv_out = "selected_scenes_table.csv"
+scene_table.to_csv(csv_out, index=False)
+print(f"\nSaved scene table: {csv_out}")
+
+# ------------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------------
+
+fig, ax = plt.subplots(figsize=(16, 14))
+gdf_m.plot(ax=ax, facecolor="none", edgecolor="gray", linewidth=0.6, alpha=0.55)  # all candidate frames
+selected.plot(ax=ax, facecolor="none", edgecolor="black", linewidth=2)  # chosen frames
+
+gpd.GeoSeries([aoi_poly_m], crs=3857).boundary.plot(ax=ax, color="blue", linewidth=3)  # AOI polygon outline
+
+for _, row in selected.iterrows():
+    x, y = row.geometry.centroid.coords[0]
+    ax.text(x, y, f"F{row['Frame']}/P{row['Path']}", fontsize=8, ha="center", color="red")
+
+ctx.add_basemap(ax, source=ctx.providers.OpenTopoMap, alpha=0.9)
+
+b = gdf_m.total_bounds
+padx, pady = (b[2] - b[0]) * 0.15, (b[3] - b[1]) * 0.15
+ax.set_xlim(b[0] - padx, b[2] + padx)
+ax.set_ylim(b[1] - pady, b[3] + pady)
+
+ax.set_axis_off()
+plt.title(f"Selected Sentinel-1 Frames (Paths: {chosen_paths}, Frame coverage: {frame_coverage*100:.1f}%)", fontsize=14)
+plt.show()
